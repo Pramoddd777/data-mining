@@ -1,0 +1,766 @@
+ANNAPURNA STORES — COMPLETE QUERY AND OUTPUT RECORD
+============================================================
+
+PART 1 — PLATFORM, LANDING & PARTITIONING
+=========================================
+
+1. SOURCE FILE COUNT
+--------------------
+
+Command:
+dir /b sales\*.csv | find /c /v ""
+
+Output:
+4457
+
+Parquet source files:
+Command:
+dir /b sales\*.parquet | find /c /v ""
+
+Output:
+0
+
+Original sales data:
+Files: 4,457
+Size: 68,706,877 bytes
+
+
+2. LOAD POSTGRESQL MASTER DATA
+------------------------------
+
+Commands:
+
+docker cp "C:\Users\ub02-glab-053\Downloads\data_2\data\masters.sql" annapurna-postgres:/tmp/masters.sql
+
+docker exec annapurna-postgres psql -U annapurna -d annapurna -f /tmp/masters.sql
+
+
+Verification:
+
+SELECT COUNT(*) FROM pg.public.stores;
+
+Output:
+12
+
+SELECT COUNT(*) FROM pg.public.products;
+
+Output:
+1224
+
+SELECT COUNT(*) FROM pg.public.product_categories;
+
+Output:
+14
+
+SELECT COUNT(*) FROM pg.public.price_revisions;
+
+Output:
+4320
+
+
+3. INGESTION
+------------
+
+Command:
+
+duckdb annapurna.duckdb -f scripts\ingest_sales.sql
+
+Output:
+
+normalized_rows   1137585
+deduplicated_rows 1120924
+final_rows        1120924
+distinct_bills    165704
+source_files      4389
+
+Duplicate rows removed:
+
+1,137,585 - 1,120,924 = 16,661
+
+
+4. BASELINE CHECKSUM
+--------------------
+
+Command:
+
+duckdb annapurna.duckdb -c "SELECT COUNT(*) AS rows, md5(string_agg(concat_ws('|', bill_no, CAST(line_no AS VARCHAR), product_code, CAST(qty AS VARCHAR), CAST(unit_price AS VARCHAR), line_type, CAST(business_date AS VARCHAR)), '|' ORDER BY bill_no, line_no)) AS checksum FROM sales_final;"
+
+Output:
+
+rows       1120924
+checksum   3f184c09e14ecca75bd1fb35bd1ac24c
+
+
+5. CREATE PARTITIONED PARQUET
+-----------------------------
+
+Command:
+
+duckdb annapurna.duckdb -c "COPY (SELECT *, year(business_date) AS sale_year, month(business_date) AS sale_month FROM sales_final) TO 'output/sales_partitioned' (FORMAT PARQUET, PARTITION_BY (store_id, sale_year, sale_month), COMPRESSION ZSTD);"
+
+File count command:
+
+dir output\sales_partitioned /s /b | find /c ".parquet"
+
+Output:
+
+144
+
+Total size command:
+
+powershell -NoProfile -Command "$files=Get-ChildItem 'output\sales_partitioned' -Recurse -Filter *.parquet; ($files | Measure-Object -Property Length -Sum).Sum"
+
+Output:
+
+12591754
+
+Partition result:
+
+144 Parquet files
+12,591,754 bytes
+
+
+6. CONNECT DUCKDB TO MINIO
+--------------------------
+
+Commands:
+
+INSTALL httpfs;
+LOAD httpfs;
+
+SET s3_endpoint='localhost:9000';
+SET s3_access_key_id='minioadmin';
+SET s3_secret_access_key='minioadmin123';
+SET s3_use_ssl=false;
+SET s3_url_style='path';
+
+
+Test all MinIO data:
+
+SELECT COUNT(*)
+FROM read_parquet('s3://annapurna-sales/sales_partitioned/**/*.parquet');
+
+Output:
+
+1120924
+
+
+7. S03 OCTOBER PARTITION TEST
+-----------------------------
+
+Query:
+
+SELECT COUNT(*)
+FROM read_parquet(
+  's3://annapurna-sales/sales_partitioned/store_id=S03/sale_year=2024/sale_month=10/*.parquet'
+);
+
+Output:
+
+13924
+
+Revenue query:
+
+SELECT
+    COUNT(*) AS rows,
+    SUM(revenue_amount) AS revenue
+FROM read_parquet(
+  's3://annapurna-sales/sales_partitioned/store_id=S03/sale_year=2024/sale_month=10/*.parquet'
+);
+
+Output:
+
+rows    revenue
+13924   14197078.02
+
+
+PART 2 — IDEMPOTENCY
+====================
+
+RUN 1
+-----
+
+normalized_rows   1137585
+deduplicated_rows 1120924
+final_rows        1120924
+distinct_bills    165704
+source_files      4389
+
+Checksum:
+
+1120924
+3f184c09e14ecca75bd1fb35bd1ac24c
+
+
+RUN 2
+-----
+
+Command:
+
+duckdb annapurna.duckdb -f scripts\ingest_sales.sql
+
+Output:
+
+normalized_rows   1137585
+deduplicated_rows 1120924
+final_rows        1120924
+distinct_bills    165704
+source_files      4389
+
+Checksum:
+
+1120924
+3f184c09e14ecca75bd1fb35bd1ac24c
+
+
+RUN 3
+-----
+
+Command:
+
+duckdb annapurna.duckdb -f scripts\ingest_sales.sql
+
+Output:
+
+normalized_rows   1137585
+deduplicated_rows 1120924
+final_rows        1120924
+distinct_bills    165704
+source_files      4389
+
+Checksum:
+
+1120924
+3f184c09e14ecca75bd1fb35bd1ac24c
+
+
+IDEMPOTENCY CONCLUSION
+----------------------
+
+All 3 runs produced exactly the same row count and checksum.
+
+The pipeline is idempotent.
+
+Deduplication key:
+(bill_no, line_no)
+
+
+PART 3 — DASHBOARD TABLES
+=========================
+
+POSTGRESQL CONNECTION
+---------------------
+
+Commands:
+
+INSTALL postgres;
+LOAD postgres;
+
+ATTACH 'host=localhost port=5433 dbname=annapurna user=annapurna password=annapurna123'
+AS pg (TYPE postgres, READ_ONLY);
+
+Verification:
+
+SELECT COUNT(*) AS stores FROM pg.public.stores;
+
+Output:
+
+12
+
+
+HISTORICAL PRODUCT JOIN
+-----------------------
+
+Query:
+
+CREATE OR REPLACE VIEW sales_enriched AS
+SELECT
+    s.bill_no,
+    s.line_no,
+    s.store_id,
+    s.product_code,
+    p.product_sk,
+    p.product_name,
+    p.category_id,
+    s.business_date,
+    s.ts,
+    s.qty,
+    s.unit_price,
+    s.line_type,
+    s.revenue_amount
+FROM sales_final s
+LEFT JOIN pg.public.products p
+    ON s.product_code = p.product_code
+   AND s.business_date >= p.valid_from
+   AND (
+        p.valid_to IS NULL
+        OR s.business_date <= p.valid_to
+   );
+
+
+Row count:
+
+SELECT COUNT(*) AS rows
+FROM sales_enriched;
+
+Output:
+
+1120924
+
+
+PRODUCT MATCHING CHECK
+----------------------
+
+Query:
+
+SELECT
+    COUNT(*) AS total_rows,
+    COUNT(product_sk) AS matched_products,
+    COUNT(*) - COUNT(product_sk) AS unmatched_products
+FROM sales_enriched;
+
+Result included non-product lines such as TAX, TENDER and DISC.
+
+Actual item-line check:
+
+SELECT
+    COUNT(*) AS item_lines,
+    COUNT(product_sk) AS matched_products,
+    COUNT(*) - COUNT(product_sk) AS unmatched_products
+FROM sales_enriched
+WHERE line_type IN ('SALE', 'RETURN', 'VOID');
+
+Output:
+
+unmatched_products = 0
+
+
+STORE/MONTH DASHBOARD
+---------------------
+
+CREATE OR REPLACE TABLE dashboard_store_month AS
+SELECT
+    store_id,
+    year(business_date) AS sale_year,
+    month(business_date) AS sale_month,
+    SUM(revenue_amount) AS revenue
+FROM sales_enriched
+WHERE line_type IN ('SALE', 'RETURN', 'DISCOUNT', 'VOID')
+GROUP BY
+    store_id,
+    year(business_date),
+    month(business_date)
+ORDER BY
+    store_id,
+    sale_year,
+    sale_month;
+
+
+CATEGORY/MONTH DASHBOARD
+------------------------
+
+CREATE OR REPLACE TABLE dashboard_category_month AS
+SELECT
+    year(business_date) AS sale_year,
+    month(business_date) AS sale_month,
+    category_id,
+    SUM(revenue_amount) AS revenue
+FROM sales_enriched
+WHERE line_type IN ('SALE', 'RETURN', 'DISCOUNT', 'VOID')
+  AND product_sk IS NOT NULL
+GROUP BY
+    year(business_date),
+    month(business_date),
+    category_id
+ORDER BY
+    sale_year,
+    sale_month,
+    category_id;
+
+
+DAY-OF-WEEK DASHBOARD
+---------------------
+
+CREATE OR REPLACE TABLE dashboard_day_of_week AS
+SELECT
+    dayofweek(business_date) AS day_of_week_number,
+    dayname(business_date) AS day_of_week,
+    SUM(revenue_amount) AS revenue
+FROM sales_enriched
+WHERE line_type IN ('SALE', 'RETURN', 'DISCOUNT', 'VOID')
+GROUP BY
+    dayofweek(business_date),
+    dayname(business_date)
+ORDER BY
+    day_of_week_number;
+
+
+MONTHLY DASHBOARD
+-----------------
+
+CREATE OR REPLACE TABLE dashboard_monthly_revenue AS
+SELECT
+    year(business_date) AS sale_year,
+    month(business_date) AS sale_month,
+    SUM(revenue_amount) AS revenue
+FROM sales_enriched
+WHERE line_type IN ('SALE', 'RETURN', 'DISCOUNT', 'VOID')
+GROUP BY
+    year(business_date),
+    month(business_date)
+ORDER BY
+    sale_year,
+    sale_month;
+
+
+STORE DIMENSION
+---------------
+
+Correct PostgreSQL column is address_line.
+
+CREATE OR REPLACE VIEW store_dimension AS
+SELECT
+    store_id,
+    store_name,
+    city,
+    address_line AS address
+FROM pg.public.stores;
+
+Output:
+
+12 rows
+
+Stores:
+
+S01 Annapurna Jayanagar
+S02 Annapurna Koramangala
+S03 Annapurna T Nagar
+S04 Annapurna Kukatpally
+S05 Annapurna Kochi Marine
+S06 Annapurna Andheri West
+S07 Annapurna Baner
+S08 Annapurna Satellite
+S09 Annapurna Vaishali
+S10 Annapurna Rajouri Garden
+S11 Annapurna Gomti Nagar
+S12 Annapurna Salt Lake
+
+
+PART 4 — HISTORICAL MARCH PRICES
+================================
+
+PRICE REVISION COLUMNS
+----------------------
+
+product_sk
+effective_from
+effective_to
+selling_price
+
+
+Query:
+
+SELECT
+    product_sk,
+    effective_from,
+    effective_to,
+    selling_price
+FROM pg.public.price_revisions
+ORDER BY product_sk, effective_from
+LIMIT 20;
+
+Example output:
+
+product_sk  effective_from  effective_to  selling_price
+
+1001        2022-01-01      2023-10-12        87.95
+1001        2023-10-13      2023-11-08        97.55
+1001        2023-11-09      2024-06-13       103.45
+1001        2024-06-14      9999-12-31       114.37
+1002        2022-01-01      2023-09-18       119.95
+1002        2023-09-19      2024-05-23       129.42
+1002        2024-05-24      2024-07-27       149.27
+1002        2024-07-28      9999-12-31       155.06
+
+
+MARCH HISTORICAL PRICE QUERY
+----------------------------
+
+SELECT
+    s.product_sk,
+    s.product_name,
+    pr.selling_price AS march_price,
+    SUM(s.qty) AS quantity_sold,
+    SUM(s.qty * pr.selling_price) AS march_value
+FROM sales_enriched s
+JOIN pg.public.price_revisions pr
+    ON s.product_sk = pr.product_sk
+   AND s.business_date >= pr.effective_from
+   AND s.business_date <= pr.effective_to
+WHERE s.business_date >= DATE '2024-03-01'
+  AND s.business_date < DATE '2024-04-01'
+  AND s.line_type IN ('SALE', 'RETURN', 'VOID')
+GROUP BY
+    s.product_sk,
+    s.product_name,
+    pr.selling_price
+ORDER BY
+    s.product_sk
+LIMIT 20;
+
+Purpose:
+
+Use product_sk + effective date range to retrieve the price valid during March 2024.
+
+
+PART 5 — CROSS-SYSTEM QUERY
+===========================
+
+MINIO CONFIGURATION
+-------------------
+
+LOAD httpfs;
+LOAD postgres;
+
+SET s3_endpoint='localhost:9000';
+SET s3_access_key_id='minioadmin';
+SET s3_secret_access_key='minioadmin123';
+SET s3_use_ssl=false;
+SET s3_url_style='path';
+
+
+POSTGRESQL ATTACH
+-----------------
+
+ATTACH 'host=localhost port=5433 dbname=annapurna user=annapurna password=annapurna123'
+AS pg (TYPE postgres, READ_ONLY);
+
+If the message says:
+
+Binder Error:
+database with name "pg" already exists
+
+then PostgreSQL is already attached.
+
+
+CROSS-SYSTEM QUERY
+------------------
+
+SELECT
+    s.store_id,
+    d.store_name,
+    d.city,
+    SUM(s.revenue_amount) AS revenue
+FROM read_parquet(
+    's3://annapurna-sales/sales_partitioned/**/*.parquet'
+) s
+JOIN pg.public.stores d
+    ON s.store_id = d.store_id
+WHERE s.business_date >= DATE '2024-10-01'
+  AND s.business_date < DATE '2024-11-01'
+  AND s.line_type IN ('SALE', 'RETURN', 'DISCOUNT', 'VOID')
+GROUP BY
+    s.store_id,
+    d.store_name,
+    d.city
+ORDER BY
+    s.store_id;
+
+
+This proves:
+
+Sales       -> MinIO
+Stores      -> PostgreSQL
+Query engine -> DuckDB
+Join        -> store_id
+
+No sales data needs to be copied into PostgreSQL.
+
+
+EXPLAIN ANALYZE
+---------------
+
+EXPLAIN ANALYZE
+SELECT
+    s.store_id,
+    d.store_name,
+    d.city,
+    SUM(s.revenue_amount) AS revenue
+FROM read_parquet(
+    's3://annapurna-sales/sales_partitioned/**/*.parquet'
+) s
+JOIN pg.public.stores d
+    ON s.store_id = d.store_id
+WHERE s.business_date >= DATE '2024-10-01'
+  AND s.business_date < DATE '2024-11-01'
+  AND s.line_type IN ('SALE', 'RETURN', 'DISCOUNT', 'VOID')
+GROUP BY
+    s.store_id,
+    d.store_name,
+    d.city
+ORDER BY
+    s.store_id;
+
+
+Important output:
+
+READ_PARQUET
+Total Files Read: 144
+
+HASH_JOIN
+Join Type: INNER
+Conditions:
+store_id = store_id
+
+TABLE_SCAN
+Table: stores
+12 rows
+
+HASH_GROUP_BY
+12 rows
+Aggregates:
+sum(#3)
+
+HTTPFS statistics:
+
+in: 38.9 KiB
+out: 0 bytes
+#GET: 1
+
+Total execution time:
+
+0.0358s
+
+
+PART 6 — FINANCE RECONCILIATION
+================================
+
+LOAD FINANCE FILE
+-----------------
+
+CREATE OR REPLACE TABLE finance_monthly AS
+SELECT *
+FROM read_csv(
+    'C:/Users/ub02-glab-053/Downloads/data_2/data/finance_monthly.csv',
+    header = true
+);
+
+Finance contains:
+
+12 months
+January 2024 through December 2024
+
+
+RECONCILIATION QUERY
+--------------------
+
+SELECT
+    f.month,
+    f.revenue_inr AS finance_revenue,
+    ROUND(CAST(d.revenue AS DOUBLE), 2) AS pipeline_revenue,
+    ROUND(
+        CAST(d.revenue AS DOUBLE) - f.revenue_inr,
+        2
+    ) AS difference
+FROM finance_monthly f
+JOIN dashboard_monthly_revenue d
+    ON f.month =
+       printf(
+           '%04d-%02d',
+           d.sale_year,
+           d.sale_month
+       )
+ORDER BY f.month;
+
+
+OUTPUT:
+
+month       finance_revenue   pipeline_revenue   difference
+
+2024-01     38446071.33       38446071.33         0.00
+2024-02     34887085.55       34887085.55         0.00
+2024-03     42457899.09       41971649.09   -486250.00
+2024-04     37958457.37       37958457.37         0.00
+2024-05     41764716.40       41764716.40         0.00
+2024-06     38987082.82       38987082.82         0.00
+2024-07     40527291.81       40295160.11   -232131.70
+2024-08     45252181.75       45252181.75         0.00
+2024-09     44615037.46       44615037.46         0.00
+2024-10     56359195.92       56359195.92         0.00
+2024-11     51583838.47       51583838.47         0.00
+2024-12     50745209.00       50745259.48        50.48
+
+
+RECONCILIATION SUMMARY
+----------------------
+
+January     MATCH
+February    MATCH
+March       DIFFERENCE: -₹486,250.00
+April       MATCH
+May         MATCH
+June        MATCH
+July        DIFFERENCE: -₹232,131.70
+August      MATCH
+September   MATCH
+October     MATCH
+November    MATCH
+December    DIFFERENCE: +₹50.48
+
+
+IMPORTANT JULY SOURCE NOTE
+--------------------------
+
+S07 (Pune) had a 3-day till-server/export gap in July 2024.
+Finance received those figures from the store by phone.
+
+Therefore the July difference must be investigated as a
+source-data completeness/reconciliation issue before calling
+it a pipeline bug.
+
+
+FINAL RESULTS
+=============
+
+SOURCE
+4,457 CSV files
+68,706,877 bytes
+
+NORMALIZED
+1,137,585 rows
+
+DEDUPLICATED
+1,120,924 rows
+
+DUPLICATES REMOVED
+16,661 rows
+
+FINAL PARQUET
+144 files
+12,591,754 bytes
+
+MINIO
+annapurna-sales/sales_partitioned/
+
+DUCKDB
+1,120,924 rows successfully queried from MinIO
+
+IDEMPOTENCY
+3 runs
+1,120,924 rows every run
+Same checksum every run:
+
+3f184c09e14ecca75bd1fb35bd1ac24c
+
+POSTGRESQL
+12 stores
+14 categories
+1,224 products
+4,320 price revisions
+
+FINANCE
+9 months exact match
+3 months require investigation:
+March  -₹486,250.00
+July   -₹232,131.70
+December +₹50.48
